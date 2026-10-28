@@ -19,7 +19,8 @@ public class MapGen : MonoBehaviour {
     
     void Start () {
         if (GenerateNewMap) {
-            Islands = FindObjectsByType<Island>(FindObjectsSortMode.None);
+            // Fixed order so the terrain heights (float sums) come out identical every load, which replays rely on
+            Islands = FindObjectsByType<Island>(FindObjectsSortMode.InstanceID);
             InitializeMap();
             InitializeTerrain();
         }

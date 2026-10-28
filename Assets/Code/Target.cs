@@ -9,9 +9,10 @@ public class Target : MonoBehaviour {
 
     private static readonly Vector3 SpinVector = new Vector3(1f, 1f, 0f);
 
-    /// Spin in place
-    internal void Update() {
-        transform.Rotate(SpinVector * SpinSpeed * Time.deltaTime);
+    /// Spin in place. Done per physics step (not per frame) because the trigger collider spins too:
+    /// tying it to the frame rate would make replays score differently from the original flight.
+    internal void FixedUpdate() {
+        transform.Rotate(SpinVector * SpinSpeed * Time.fixedDeltaTime);
     }
     
     internal void OnTriggerEnter(Collider other) {

@@ -1,4 +1,5 @@
-﻿using UnityEngine;
+﻿using System.Collections.Generic;
+using UnityEngine;
 using UnityEngine.UI;
 
 /// Control code for the player's game object.
@@ -52,12 +53,45 @@ public class PlayerControl : MonoBehaviour {
     }
     #endregion
 
+    #region Replay
+    private const int ChecksumInterval = 50;   // hash the state once per second of flight
+    private IInputSource inputSource;          // the controller, or a recording
+    private Recording recording;               // the flight being recorded (null while watching a replay)
+    private ReplayController replay;
+    private int tick;                          // physics steps since the flight started
+    private bool desyncReported;
+    #endregion
+
     /// Initialize component
     internal void Start() {
         playerRB = GetComponent<Rigidbody>();
+        playerRB.interpolation = RigidbodyInterpolation.Interpolate;   // smooth motion in slow-motion replays
+
+        replay = gameObject.AddComponent<ReplayController>();
+        replay.Init(GameOverText);
+
+        if (ReplaySession.IsReplaying) {
+            // Replay: same starting state and step size as the recorded flight, inputs from the recording
+            Recording rec = ReplaySession.PendingReplay;
+            inputSource = new ReplayInput(rec.frames);
+            Time.fixedDeltaTime = rec.fixedDeltaTime;
+            transform.SetPositionAndRotation(rec.startPosition, rec.startRotation);
+            playerRB.position = rec.startPosition;
+            playerRB.rotation = rec.startRotation;
+            rkVelocity = rec.startVelocity;
+        } else {
+            // Live flight: controller input, recorded as we go
+            inputSource = new LiveInput();
+            rkVelocity = transform.forward*3;
+            recording = new Recording {
+                fixedDeltaTime = Time.fixedDeltaTime,
+                startPosition = transform.position,
+                startRotation = transform.rotation,
+                startVelocity = rkVelocity
+            };
+        }
 
         // Initial state for our integrator
-        rkVelocity = transform.forward*3;
         rkAngularVelocity = Vector3.zero;
 
         // RK4 handles gravity and damping itself, so Unity must not add its own
@@ -72,21 +106,47 @@ public class PlayerControl : MonoBehaviour {
         if (gameOver)
             return;
 
-        thrust = Mathf.Max(0f, Input.GetAxis("Thrust")) * MaximumThrust;
+        // Same inputs at the same steps = the same flight, so this is all a replay needs
+        InputFrame input = inputSource.Get(tick);
+        recording?.frames.Add(input);
+        RecordOrVerifyChecksum();
+
+        thrust = input.thrust * MaximumThrust;
 
         Controls c;
         c.thrust = thrust;
-        c.localAngularAccel = ControlAngularAccel();
+        c.localAngularAccel = ControlAngularAccel(input);
         c.wind = GetWindVelocity();
 
         StepRK4(c);
+        tick++;
+    }
+
+    /// Live flight: store a hash of the state every second.
+    /// Replay: compare against the stored hash and warn at the first step where the replay diverged.
+    private void RecordOrVerifyChecksum() {
+        if (tick % ChecksumInterval != 0)
+            return;
+
+        uint hash = Recording.Hash(playerRB.position, rkVelocity, playerRB.rotation, rkAngularVelocity);
+        if (recording != null) {
+            recording.checksums.Add(hash);
+            return;
+        }
+
+        List<uint> expected = ReplaySession.PendingReplay.checksums;
+        int i = tick / ChecksumInterval;
+        if (!desyncReported && i < expected.Count && expected[i] != hash) {
+            desyncReported = true;
+            Debug.LogWarning($"Replay desync at physics step {tick} ({tick * Time.fixedDeltaTime:0.00} s into the flight)");
+        }
     }
 
     #region Controls
     /// Steering: the stick sets angular acceleration about the plane's own axes (rad/s²).
-    private Vector3 ControlAngularAccel() {
-        float pitchInput = Input.GetAxis("Vertical");
-        float rollInput  = Input.GetAxis("Horizontal");
+    private Vector3 ControlAngularAccel(InputFrame input) {
+        float pitchInput = input.pitch;
+        float rollInput  = input.roll;
 
         // Response curve: gentle near center, full strength at full deflection
         pitchInput *= Mathf.Abs(pitchInput);
@@ -232,18 +292,31 @@ public class PlayerControl : MonoBehaviour {
 
     private Vector3 GetWindVelocity() {
         Collider[] updrafts = Physics.OverlapSphere(
-            transform.position,                            // center: the plane
+            playerRB.position,                             // center: the plane (physics position; transform is interpolated for display)
             0.5f,                                    // small radius around the plane
             LayerMask.GetMask("Updrafts"), // only look at updrafts
             QueryTriggerInteraction.Collide);              // updrafts are trigger colliders, so include triggers
 
-        Vector3 wind = Vector3.zero;
+        var winds = new List<Vector3>(updrafts.Length);
         foreach (Collider c in updrafts) {
             Updraft updraft = c.GetComponent<Updraft>();
             if (updraft != null)
-                wind += updraft.WindVelocity;
+                winds.Add(updraft.WindVelocity);
         }
+
+        // Add in a fixed order: float sums depend on order, and replays must match exactly
+        winds.Sort(CompareVectors);
+        Vector3 wind = Vector3.zero;
+        foreach (Vector3 w in winds)
+            wind += w;
         return wind;
+    }
+
+    private static int CompareVectors(Vector3 a, Vector3 b) {
+        int order = a.x.CompareTo(b.x);
+        if (order == 0) order = a.y.CompareTo(b.y);
+        if (order == 0) order = a.z.CompareTo(b.z);
+        return order;
     }
 
     /// Show game-over display
@@ -257,12 +330,20 @@ public class PlayerControl : MonoBehaviour {
         } else {
             GameOverText.text = "You Lose!";
         }
+
+        // Keep live flights for replaying, then start the "Press B to replay" countdown
+        if (recording != null)
+            ReplaySession.LastRecording = recording;
+        replay.OnFlightEnded(GameOverText.text);
     }
 
     /// Display status information
     internal void OnGUI()
     {
-        StatusDisplay.text = string.Format("Speed: {0:00.00}    altitude: {1:00.00}    Thrust {2:0.0}",
+        string replayLabel = ReplaySession.IsReplaying
+            ? $"<color=#FFD54A>REPLAY {replay.SpeedLabel}</color>    "
+            : "";
+        StatusDisplay.text = replayLabel + string.Format("Speed: {0:00.00}    altitude: {1:00.00}    Thrust {2:0.0}",
             playerRB.linearVelocity.magnitude,
             transform.position.y,
             thrust);
